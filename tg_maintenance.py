@@ -6,7 +6,9 @@ Subcommands:
 
   index-dialogs       -> Export CSV listing of all dialogs
   backup-remaining    -> Backup all remaining dialogs (except Saved Messages)
+  backup-saved        -> Backup Saved Messages (optionally with media)
   count-files         -> Count media files per chat in an archive & write meta.json
+  chat-to-html        -> Render a backed up chat as a standalone HTML file
   cleanup-interactive -> Interactive cleanup of old, low-file-count chats
   retry-failed        -> Retry deletions from cleanup_failed_deletes.json
   force-delete-ghosts -> Force-delete ghost/stuck chats by id
@@ -17,6 +19,7 @@ All commands share the same Telethon session & .env config.
 import argparse
 import csv
 import glob
+import html
 import json
 import os
 import re
@@ -82,6 +85,24 @@ def find_latest_dialog_csv(pattern="telegram_dialog_index_*.csv") -> str | None:
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def find_chat_folder_by_id(archive_root: str, chat_id: int) -> str:
+    """
+    Given an archive root and a chat id, find the per-chat folder created by safe_name().
+    We match folders whose name ends with _<chat_id>.
+    """
+    suffix = f"_{chat_id}"
+    candidates = [
+        d
+        for d in os.listdir(archive_root)
+        if d.endswith(suffix) and os.path.isdir(os.path.join(archive_root, d))
+    ]
+    if not candidates:
+        raise RuntimeError(f"No chat folder ending with '{suffix}' found in {archive_root}")
+    if len(candidates) > 1:
+        print(f"[WARN] Multiple chat folders match id={chat_id}, using first: {candidates[0]}")
+    return os.path.join(archive_root, candidates[0])
 
 
 # ======================================================================
@@ -196,10 +217,17 @@ async def cmd_index_dialogs(args):
 
 
 # ======================================================================
-# COMMAND: backup-remaining
+# COMMAND: backup-remaining / backup-saved
 # ======================================================================
 
-async def backup_dialog(entity, title: str, archive_dir: str):
+async def backup_dialog(entity, title: str, archive_dir: str, *, download_media: bool = False, media_subdir: str = "media"):
+    """
+    Backup a single dialog into archive_dir / <safe_folder>.
+
+    - Always writes messages.jsonl (normalized Telethon messages).
+    - If download_media=True, also downloads media into a media/ subfolder and
+      annotates each JSON line with a "_local_media" relative path when present.
+    """
     chat_id = entity.id
     folder_name = safe_name(title, chat_id)
     folder_path = os.path.join(archive_dir, folder_name)
@@ -223,15 +251,38 @@ async def backup_dialog(entity, title: str, archive_dir: str):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    media_root = None
+    if download_media:
+        media_root = os.path.join(folder_path, media_subdir)
+        os.makedirs(media_root, exist_ok=True)
+
     print(f"  Exporting messages from {title} -> {export_file}")
     count = 0
+    media_count = 0
     with open(export_file, "w", encoding="utf-8") as f:
         async for msg in client.iter_messages(entity, reverse=True):
             data = normalize(msg.to_dict())
+
+            # Optional media download
+            media_path_rel = None
+            if download_media and getattr(msg, "media", None):
+                try:
+                    # When file is a directory, Telethon chooses a filename.
+                    media_path = await msg.download_media(file=media_root)
+                    if media_path:
+                        media_path_rel = os.path.relpath(media_path, folder_path)
+                        media_count += 1
+                except Exception as e:
+                    print(f"    [WARN] Failed to download media for msg {getattr(msg, 'id', '?')}: {e}")
+
+            if media_path_rel:
+                # Attach relative path so chat-to-html (and other tooling) can find it.
+                data["_local_media"] = media_path_rel
+
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
             count += 1
 
-    print(f"  Done: {count} messages")
+    print(f"  Done: {count} messages; {media_count} media files")
 
 
 async def cmd_backup_remaining(args):
@@ -267,11 +318,36 @@ async def cmd_backup_remaining(args):
 
         print(f"\nBacking up {title} (id={entity.id}, type={type(entity).__name__})")
         try:
-            await backup_dialog(entity, title, archive_dir)
+            await backup_dialog(entity, title, archive_dir, download_media=args.download_media)
         except Exception as e:
             print(f"[ERROR] Could not backup {title}: {e}")
 
     print("\nFinished backing up all remaining chats.")
+
+
+async def cmd_backup_saved(args):
+    """
+    Dedicated Saved Messages backup.
+
+    This is basically backup-remaining but targeting only your 'Saved Messages'
+    dialog, with an optional media download.
+    """
+    archive_dir = args.archive_dir
+    if archive_dir is None:
+        archive_dir = f"telegram_saved_messages_{date.today().isoformat()}"
+    os.makedirs(archive_dir, exist_ok=True)
+
+    me = await client.get_me()
+    title = "Saved Messages"
+
+    print(f"\nBacking up Saved Messages (id={me.id}) into: {archive_dir}\n")
+    try:
+        await backup_dialog(me, title, archive_dir, download_media=args.download_media)
+    except Exception as e:
+        print(f"[ERROR] Could not backup Saved Messages: {e}")
+        return
+
+    print("\nFinished backing up Saved Messages.")
 
 
 # ======================================================================
@@ -331,6 +407,156 @@ def cmd_count_files(args):
         total_chats += 1
 
     print(f"\nUpdated meta for {total_chats} chat folders.")
+
+
+# ======================================================================
+# COMMAND: chat-to-html
+# ======================================================================
+
+def render_message_html(msg: dict) -> str:
+    """
+    Render a single normalized Telethon message dict into HTML.
+    Uses 'out' to distinguish direction and '_local_media' when present.
+    """
+    msg_id = msg.get("id", "")
+    date_str = msg.get("date", "")
+    text = msg.get("message") or ""
+
+    # Basic sender label
+    if msg.get("out"):
+        sender = "Me"
+        direction_class = "out"
+    else:
+        sender = "Them"
+        direction_class = "in"
+
+    text_html = html.escape(text).replace("\n", "<br>")
+
+    media_html = ""
+    local_media = msg.get("_local_media")
+    if local_media:
+        media_html = f'<div class="media"><a href="{html.escape(local_media)}">[media]</a></div>'
+
+    # If no text and no media, skip
+    if not text_html and not media_html:
+        return ""
+
+    return f"""
+    <div class="bubble {direction_class}" id="m{msg_id}">
+      <div class="meta">{html.escape(sender)} · {html.escape(str(date_str))} · #{msg_id}</div>
+      <div class="body">{text_html}</div>
+      {media_html}
+    </div>
+    """.strip()
+
+
+def cmd_chat_to_html(args):
+    archive_root = args.archive_root
+    chat_id = args.chat_id
+    output = args.output
+
+    if not os.path.isdir(archive_root):
+        raise RuntimeError(f"Archive root '{archive_root}' does not exist")
+
+    chat_folder = find_chat_folder_by_id(archive_root, chat_id)
+
+    meta_path = os.path.join(chat_folder, "meta.json")
+    msg_path = os.path.join(chat_folder, "messages.jsonl")
+    if not os.path.isfile(msg_path):
+        raise RuntimeError(f"No messages.jsonl found in {chat_folder}")
+
+    title = f"chat_{chat_id}"
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                title = meta.get("title", title)
+        except Exception:
+            pass
+
+    if output is None:
+        output = os.path.join(chat_folder, "chat.html")
+
+    print(f"Rendering chat '{title}' (id={chat_id}) from {msg_path} -> {output}")
+
+    count = 0
+    with open(msg_path, "r", encoding="utf-8") as src, open(output, "w", encoding="utf-8") as dst:
+        dst.write(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #ece5dd;
+      margin: 0;
+      padding: 1rem;
+    }}
+    .container {{
+      max-width: 960px;
+      margin: 0 auto;
+      background: #d2dbdc;
+      padding: 1rem;
+      border-radius: 8px;
+      box-shadow: 0 0 4px rgba(0,0,0,0.1);
+    }}
+    .bubble {{
+      max-width: 70%;
+      margin: 0.25rem 0;
+      padding: 0.5rem 0.75rem;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 1px 1px rgba(0,0,0,0.05);
+    }}
+    .bubble.out {{
+      margin-left: auto;
+      background: #dcf8c6;
+    }}
+    .bubble.in {{
+      margin-right: auto;
+      background: #ffffff;
+    }}
+    .meta {{
+      font-size: 0.7rem;
+      color: #555;
+      margin-bottom: 0.25rem;
+    }}
+    .body {{
+      white-space: pre-wrap;
+      font-size: 0.9rem;
+    }}
+    .media {{
+      margin-top: 0.25rem;
+      font-size: 0.8rem;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>{html.escape(title)}</h1>
+""")
+        for line in src:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            html_chunk = render_message_html(msg)
+            if not html_chunk:
+                continue
+            dst.write(html_chunk + "\n")
+            count += 1
+
+        dst.write("""
+  </div>
+</body>
+</html>
+""")
+
+    print(f"Rendered {count} messages to HTML.")
 
 
 # ======================================================================
@@ -757,6 +983,23 @@ def build_arg_parser():
         action="store_true",
         help="Include Saved Messages in backup",
     )
+    sp.add_argument(
+        "--download-media",
+        action="store_true",
+        help="Also download media/files per chat into a media/ subfolder",
+    )
+
+    # backup-saved
+    sp = sub.add_parser("backup-saved", help="Backup Saved Messages (optionally with media)")
+    sp.add_argument(
+        "--archive-dir",
+        help="Archive directory (default: telegram_saved_messages_<today>)",
+    )
+    sp.add_argument(
+        "--download-media",
+        action="store_true",
+        help="Also download media/files into a media/ subfolder",
+    )
 
     # count-files
     sp = sub.add_parser("count-files", help="Count files in archive & write meta.json per chat")
@@ -764,6 +1007,24 @@ def build_arg_parser():
         "--archive-root",
         required=True,
         help="Path to archive root (e.g. telegram_archive_remaining_2025-11-18)",
+    )
+
+    # chat-to-html
+    sp = sub.add_parser("chat-to-html", help="Render a backed up chat into a single HTML file")
+    sp.add_argument(
+        "--archive-root",
+        required=True,
+        help="Path to archive root with per-chat folders",
+    )
+    sp.add_argument(
+        "--chat-id",
+        type=int,
+        required=True,
+        help="Chat ID to render (matches folder suffix _<id>)",
+    )
+    sp.add_argument(
+        "--output",
+        help="Output HTML filename (default: <chat_folder>/chat.html)",
     )
 
     # cleanup-interactive
@@ -829,8 +1090,12 @@ def main():
             client.loop.run_until_complete(cmd_index_dialogs(args))
         elif args.command == "backup-remaining":
             client.loop.run_until_complete(cmd_backup_remaining(args))
+        elif args.command == "backup-saved":
+            client.loop.run_until_complete(cmd_backup_saved(args))
         elif args.command == "count-files":
             cmd_count_files(args)
+        elif args.command == "chat-to-html":
+            cmd_chat_to_html(args)
         elif args.command == "cleanup-interactive":
             client.loop.run_until_complete(cmd_cleanup_interactive(args))
         elif args.command == "retry-failed":

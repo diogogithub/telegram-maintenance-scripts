@@ -4,7 +4,10 @@ A small **maintenance toolkit** around [Telethon](https://github.com/LonamiWebs/
 
 - 📋 Export a CSV index of all your dialogs  
 - 💾 Backup all messages from remaining dialogs (except Saved Messages by default)  
+- 💾📥 Backup **Saved Messages** (with optional media/files)  
+- 📦 Optionally download media/files for each chat into a local folder  
 - 📊 Count media files per chat in an archive  
+- 🗂️ Render a backed-up chat as a standalone **HTML transcript**  
 - 🧹 Interactively cleanup old/lightweight chats you've already backed up  
 - 🔁 Retry deletions that hit flood limits  
 - 👻 Force-delete ghost / stuck chats that Telegram Desktop won't let you remove  
@@ -64,7 +67,9 @@ Available commands:
 
 * `index-dialogs` - export CSV index of dialogs
 * `backup-remaining` - backup all current dialogs (except Saved Messages by default)
+* `backup-saved` - backup your **Saved Messages** dialog
 * `count-files` - count media files in an archive and write `meta.json`
+* `chat-to-html` - render a backed-up chat as a standalone HTML file
 * `cleanup-interactive` - interactively delete/leave backed-up, old, low-file chats
 * `retry-failed` - retry deletions that hit flood limits
 * `force-delete-ghosts` - manually purge ghost chats by numeric ID
@@ -113,16 +118,88 @@ telegram_archive_remaining_<YYYY-MM-DD>/
 You can customize the archive directory:
 
 ```bash
-python tg_maintenance.py backup-remaining --archive-dir telegram_archive_full_2025-11-18
+python tg_maintenance.py backup-remaining \
+  --archive-dir telegram_archive_full_2025-11-18
 ```
 
-To also include Saved Messages (if you haven't exported them via Telegram Desktop):
+To also include Saved Messages in this "everything" backup:
 
 ```bash
 python tg_maintenance.py backup-remaining --include-saved
 ```
 
-Each `messages.jsonl` is **one JSON object per line**, in chronological order. `meta.json` contains basic metadata plus `total_messages`/`file_count` once you run `count-files`.
+### 2.1 Also download media/files during backup
+
+Both `backup-remaining` and `backup-saved` support a flag to download media/files:
+
+```bash
+python tg_maintenance.py backup-remaining \
+  --archive-dir telegram_archive_remaining_2025-11-18 \
+  --download-media
+```
+
+With `--download-media`:
+
+```text
+telegram_archive_remaining_2025-11-18/
+  Some_Group_123456789/
+    meta.json
+    messages.jsonl
+    media/
+      <downloaded files...>
+```
+
+Each `messages.jsonl` line is still **one JSON object per line**, in chronological order, but if a message had media and the download succeeded, the JSON object also gets an extra field:
+
+```json
+{
+  "...": "...",
+  "media": { ... },
+  "_local_media": "media/photo_123.jpg"
+}
+```
+
+That `_local_media` relative path is used by `chat-to-html` (and any other tooling you write) to link to the downloaded file.
+
+`meta.json` contains basic metadata plus `total_messages`/`file_count` once you run `count-files`.
+
+---
+
+## 2b. Backup Saved Messages (with optional media)
+
+There is a dedicated command for **Saved Messages**, which backs up your self-chat only:
+
+```bash
+python tg_maintenance.py backup-saved
+```
+
+You can choose the archive directory:
+
+```bash
+python tg_maintenance.py backup-saved \
+  --archive-dir telegram_saved_messages_2025-11-18
+```
+
+And you can also download media/files from Saved Messages:
+
+```bash
+python tg_maintenance.py backup-saved \
+  --archive-dir telegram_saved_messages_2025-11-18 \
+  --download-media
+```
+
+The folder structure is similar:
+
+```text
+telegram_saved_messages_2025-11-18/
+  Saved_Messages_<your_user_id>/
+    meta.json
+    messages.jsonl
+    media/          # only if --download-media was used
+      <downloaded files...>
+```
+
+This is particularly handy if you use Saved Messages as a personal **inbox / bookmark / file stash** and want a full local copy.
 
 ---
 
@@ -236,12 +313,48 @@ Use carefully; this is meant for chats you **cannot** remove via the normal Tele
 
 ---
 
+## 7. Export a chat archive to HTML
+
+Once you have a backup (from `backup-remaining` or `backup-saved`), you can turn any chat into a **self-contained HTML transcript**.
+
+```bash
+python tg_maintenance.py chat-to-html \
+  --archive-root telegram_archive_remaining_2025-11-18 \
+  --chat-id 123456789
+```
+
+This:
+
+* Locates the per-chat folder whose name ends with `_<chat-id>` (e.g. `Some_Group_123456789`)
+* Reads `messages.jsonl`
+* Writes `chat.html` inside that folder by default (or wherever you point `--output`)
+
+Example with custom output path:
+
+```bash
+python tg_maintenance.py chat-to-html \
+  --archive-root telegram_saved_messages_2025-11-18 \
+  --chat-id 123456789 \
+  --output saved_messages.html
+```
+
+The HTML:
+
+* Renders messages as chat-style **bubbles** (`Me` vs `Them`)
+* Uses timestamps and message IDs from the backup
+* If you used `--download-media`, any message with a `_local_media` field will show a local `[media]` link to that file (e.g. an image, document, etc.)
+
+You can open the resulting `chat.html` in any browser, or print to PDF if you want a "frozen" transcript.
+
+---
+
 ## 🛡️ Safety tips
 
-* Always make backups (`backup-remaining`) **before** aggressive cleanup.
+* Always make backups (`backup-remaining` / `backup-saved`) **before** aggressive cleanup.
 * Use `cleanup-interactive` conservatively at first (e.g. very old cutoff date + low file_limit).
 * Keep your archives somewhere safe (e.g. encrypted disk / backup drive).
-* You can re-run `index-dialogs` and keep a CSV snapshot of your post-cleanup state.
+* You can re-run `index-dialogs` and keep a CSV snapshot of your **post-cleanup** state.
+* If you care about attachments, remember to use `--download-media` during backups.
 
 ---
 
@@ -249,7 +362,8 @@ Use carefully; this is meant for chats you **cannot** remove via the normal Tele
 
 * Written with [Telethon](https://github.com/LonamiWebs/Telethon)
 * Tested with Python 3.10+ and recent Telethon versions
-* You can split `tg_maintenance.py` into modules if you prefer; it's a single file for portability
+* Single-file script (`tg_maintenance.py`) for portability, but you can split it into modules if you prefer
+* `chat-to-html` deliberately keeps HTML/CSS minimal so you can easily tweak the look
 
 PRs / tweaks / feature ideas are welcome.
-If you find a better heuristic for "ghost" chats or want more backup formats (Markdown/HTML), extend away. 🙂
+If you find a better heuristic for "ghost" chats or want more backup formats / viewers, extend away. 🙂
